@@ -85,7 +85,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           if-no-files-found: "error"
-          name: quic-dns-${{ matrix.target }}
+          name: risc-emulator-${{ matrix.target }}
           path: |
             ./target/${{ matrix.target }}/release/risc-emulator
             ./target/${{ matrix.target }}/release/risc-emulator.exe
