@@ -87,5 +87,5 @@ jobs:
           if-no-files-found: "error"
           name: quic-dns-${{ matrix.target }}
           path: |
-            ./target/${{ matrix.target }}/release/quic-dns
-            ./target/${{ matrix.target }}/release/quic-dns.exe
+            ./target/${{ matrix.target }}/release/risc-emulator
+            ./target/${{ matrix.target }}/release/risc-emulator.exe
