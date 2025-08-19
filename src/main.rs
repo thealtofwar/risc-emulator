@@ -1,4 +1,8 @@
+mod kernel_io;
+mod memory;
 mod register;
+mod time;
+mod user;
 mod utils;
 
 use core::panic;
@@ -7,8 +11,11 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
-use std::u64;
+use std::time::Instant;
 
+use bytemuck::bytes_of;
+use bytemuck::cast_slice;
+use bytemuck::from_bytes;
 use clap::Parser;
 use elf::ElfBytes;
 use elf::abi::ELFOSABI_LINUX;
@@ -24,36 +31,16 @@ use log::debug;
 use log::info;
 use log::trace;
 use raki::Decode;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use utils::*;
 
+use crate::kernel_io::iovec;
+use crate::memory::MemorySegment;
+use crate::memory::MemoryTable;
 use crate::register::Register;
-
-type MemoryTable = Vec<(MemorySegment, i64)>;
-
-#[derive(Clone)]
-struct MemorySegment {
-    memory: Vec<u8>,
-}
-
-fn map_address(segments: &MemoryTable, addr: i64) -> Option<(&Vec<u8>, usize)> {
-    for segment in segments {
-        if addr >= segment.1 && addr < segment.1 + segment.0.memory.len() as i64 {
-            // guaranteed to succeed, since the length of a segment must be less than usize
-            return Some((&segment.0.memory, (addr - segment.1).try_into().unwrap()));
-        }
-    }
-    None
-}
-
-fn map_address_mut(segments: &mut MemoryTable, addr: i64) -> Option<(&mut MemorySegment, usize)> {
-    for segment in segments {
-        if addr >= segment.1 && addr < segment.1 + segment.0.memory.len() as i64 {
-            // guaranteed to succeed, since the length of a segment must be less than usize
-            return Some((&mut segment.0, (addr - segment.1).try_into().unwrap()));
-        }
-    }
-    None
-}
+use crate::time::timespec;
+use crate::user::new_utsname;
 
 fn dumpregs(registers: &[Register], instruction_pointer: &Register) {
     let mut result = String::new();
@@ -68,17 +55,36 @@ fn push_to_stack(stack_ptr: &mut usize, stack: &mut MemorySegment, value: u64) {
     *stack_ptr -= 8;
 }
 
-fn push_auxv(stack_ptr: &mut usize, stack: &mut MemorySegment, key: u64, value: u64) {
-    push_to_stack(stack_ptr, stack, value);
-    push_to_stack(stack_ptr, stack, key);
+fn setup_random(host_stack_ptr: &mut usize, stack: &mut MemorySegment) -> usize {
+    let mut random = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut random)
+        .expect("Could not fill 16 bytes using OS rng");
+    stack.memory[*host_stack_ptr - 16..*host_stack_ptr].copy_from_slice(&random);
+    *host_stack_ptr -= 16;
+    *host_stack_ptr
 }
 
-fn setup_auxv(stack_ptr: &mut usize, stack: &mut MemorySegment) {
-    push_auxv(stack_ptr, stack, 0, 0); // AT_NULL = 0
-    push_auxv(stack_ptr, stack, 11, 1000); // AT_UID(11) = 1000 
-    push_auxv(stack_ptr, stack, 12, 1000); // AT_EUID(11) = 1000
-    push_auxv(stack_ptr, stack, 13, 1000); // AT_GID(13) = 1000 
-    push_auxv(stack_ptr, stack, 14, 1000); // AT_EGID(14) = 1000
+fn push_auxv(host_stack_ptr: &mut usize, stack: &mut MemorySegment, key: u64, value: u64) {
+    push_to_stack(host_stack_ptr, stack, value);
+    push_to_stack(host_stack_ptr, stack, key);
+}
+
+fn setup_auxv(host_stack_ptr: &mut usize, stack: &mut MemorySegment, guest_start_of_stack: usize) {
+    let host_random_addr = setup_random(host_stack_ptr, stack);
+    push_auxv(host_stack_ptr, stack, 0, 0); // AT_NULL = 0
+    push_auxv(host_stack_ptr, stack, 11, 1000); // AT_UID(11) = 1000 
+    push_auxv(host_stack_ptr, stack, 12, 1000); // AT_EUID(11) = 1000
+    push_auxv(host_stack_ptr, stack, 13, 1000); // AT_GID(13) = 1000 
+    push_auxv(host_stack_ptr, stack, 14, 1000); // AT_EGID(14) = 1000
+    push_auxv(
+        host_stack_ptr,
+        stack,
+        25,
+        (host_random_addr + guest_start_of_stack)
+            .try_into()
+            .unwrap(),
+    );
 }
 
 fn run_elf(path: PathBuf) {
@@ -106,7 +112,7 @@ fn run_elf(path: PathBuf) {
     let ph_count = file.ehdr.e_phnum;
     let ph_table = file.ehdr.e_phoff;
     let ph_entry_size = file.ehdr.e_phentsize;
-    let mut segments: MemoryTable = Vec::new();
+    let mut memory_table: MemoryTable = MemoryTable::new();
 
     debug!("Reading program headers");
     for i in 0..ph_count {
@@ -124,24 +130,29 @@ fn run_elf(path: PathBuf) {
             segment.memory[..ph.p_filesz as usize].copy_from_slice(
                 &slice[ph.p_offset as usize..ph.p_offset as usize + ph.p_filesz as usize],
             );
-            segments.push((segment, ph.p_vaddr as i64));
+            memory_table.push((segment, ph.p_vaddr as i64));
         }
     }
     debug!("Allocating stack");
-    segments.push((
+    let guest_start_of_stack = 0x7FFFFFFF00000000i64; // Use a more standard initial stack address
+    memory_table.push((
         MemorySegment {
-            memory: vec![0; 1024 * 1024],
+            memory: vec![0; 2 * 1024 * 1024], // Use a larger stack (2MB)
         },
-        0xFFFFFFFF,
+        guest_start_of_stack,
     ));
-    let mut stack_ptr: usize = 1024 * 1024;
-    let stack = &mut segments.last_mut().unwrap().0;
-    setup_auxv(&mut stack_ptr, stack);
+    let mut stack_ptr: usize = 2 * 1024 * 1024;
+    let stack = &mut memory_table.last_mut().unwrap().0;
+    setup_auxv(
+        &mut stack_ptr,
+        stack,
+        guest_start_of_stack.try_into().unwrap(),
+    );
     push_to_stack(&mut stack_ptr, stack, 0); // null pointer for end of envp
     push_to_stack(&mut stack_ptr, stack, 0); // null pointer for end of argv
     push_to_stack(&mut stack_ptr, stack, 0); // argc = 0
 
-    for segment in &segments {
+    for segment in &memory_table {
         debug!(
             "Segment of length {}, starting at 0x{:x}",
             segment.0.memory.len(),
@@ -152,19 +163,23 @@ fn run_elf(path: PathBuf) {
     debug!("Setting up registers");
     let mut registers = [Register::default(); 32];
 
-    registers[2].put_i64(0xFFFFFFFF + stack_ptr as i64); // set stack pointer
+    registers[2].put_i64(guest_start_of_stack + stack_ptr as i64); // set stack pointer
+    registers[3].put_i64(0);
 
     debug!("Found entrypoint {:x}", file.ehdr.e_entry);
     let mut instruction_pointer = Register {
         value: file.ehdr.e_entry.to_le_bytes(),
     };
+    let start = Instant::now();
     loop {
-        let addr = map_address(&segments, instruction_pointer.get_i64()).unwrap_or_else(|| {
-            panic!(
-                "Tried to access {:x}, but no value exists!",
-                instruction_pointer.get_i64()
-            )
-        });
+        let addr = memory_table
+            .map_address(instruction_pointer.get_i64())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Tried to access {:x}, but no value exists!",
+                    instruction_pointer.get_i64()
+                )
+            });
         let slc = &addr.0[addr.1 as usize..addr.1 as usize + 4_usize];
         let val = u32::from_slice(slc);
         let insn = match val.decode(raki::Isa::Rv64) {
@@ -279,7 +294,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -291,7 +307,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -303,7 +320,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -315,7 +333,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -327,7 +346,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -338,7 +358,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -350,7 +371,8 @@ fn run_elf(path: PathBuf) {
                         if insn.rd.unwrap() != 0 {
                             let virtual_address =
                                 registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                            let (segment, addr) = map_address(&segments, virtual_address)
+                            let (segment, addr) = memory_table
+                                .map_address(virtual_address)
                                 .unwrap_or_else(|| {
                                     panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                                 });
@@ -361,40 +383,44 @@ fn run_elf(path: PathBuf) {
                     raki::BaseIOpcode::SB => {
                         let virtual_address =
                             registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                        let (segment, addr) = map_address_mut(&mut segments, virtual_address)
+                        let (segment, addr) = memory_table
+                            .map_address_mut(virtual_address)
                             .unwrap_or_else(|| {
                                 panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                             });
-                        segment.memory[addr] = registers[insn.rs2.unwrap()].value[0];
+                        segment[addr] = registers[insn.rs2.unwrap()].value[0];
                     }
                     raki::BaseIOpcode::SH => {
                         let virtual_address =
                             registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                        let (segment, addr) = map_address_mut(&mut segments, virtual_address)
+                        let (segment, addr) = memory_table
+                            .map_address_mut(virtual_address)
                             .unwrap_or_else(|| {
                                 panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                             });
-                        segment.memory[addr..addr + 2]
+                        segment[addr..addr + 2]
                             .copy_from_slice(&registers[insn.rs2.unwrap()].value[0..2]);
                     }
                     raki::BaseIOpcode::SW => {
                         let virtual_address =
                             registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                        let (segment, addr) = map_address_mut(&mut segments, virtual_address)
+                        let (segment, addr) = memory_table
+                            .map_address_mut(virtual_address)
                             .unwrap_or_else(|| {
                                 panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                             });
-                        segment.memory[addr..addr + 4]
+                        segment[addr..addr + 4]
                             .copy_from_slice(&registers[insn.rs2.unwrap()].value[0..4]);
                     }
                     raki::BaseIOpcode::SD => {
                         let virtual_address =
                             registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
-                        let (segment, addr) = map_address_mut(&mut segments, virtual_address)
+                        let (segment, addr) = memory_table
+                            .map_address_mut(virtual_address)
                             .unwrap_or_else(|| {
                                 panic!("Tried to map {virtual_address}, but it wasn't mapped!")
                             });
-                        segment.memory[addr..addr + 8]
+                        segment[addr..addr + 8]
                             .copy_from_slice(&registers[insn.rs2.unwrap()].value);
                     }
                     raki::BaseIOpcode::ADDI => {
@@ -547,9 +573,9 @@ fn run_elf(path: PathBuf) {
                     raki::BaseIOpcode::ECALL => {
                         debug!("syscall with {}", registers[17].get_i64());
                         match registers[17].get_i64() {
-                            48 => {
+                            48 | 78 => {
                                 let addr = registers[11].get_i64();
-                                let mut mem = map_address(&segments, addr).unwrap_or_else(|| {
+                                let mut mem = memory_table.map_address(addr).unwrap_or_else(|| {
                                     panic!("Tried to read {addr}, but it was not mapped!")
                                 });
                                 let mut chars: Vec<u8> = vec![];
@@ -568,8 +594,32 @@ fn run_elf(path: PathBuf) {
                                 if registers[10].get_u64() == 1 {
                                     // stdout
                                     let mut stdout = io::stdout().lock();
-                                    let mem = map_address(&segments, registers[11].get_i64()).unwrap_or_else(|| panic!("Tried to output memory from non-existant address {}", registers[11].get_i64()));
+                                    let mem = memory_table.map_address(registers[11].get_i64()).unwrap_or_else(|| panic!("Tried to output memory from non-existant address {}", registers[11].get_i64()));
                                     let len = registers[12].get_u64() as usize;
+                                    match stdout.write(&mem.0[mem.1..mem.1 + len]) {
+                                        Ok(written) => {
+                                            registers[10].put_i64(written as i64);
+                                        }
+                                        Err(_) => {
+                                            registers[10].put_i64(-1);
+                                        }
+                                    }
+                                }
+                            }
+                            66 => {
+                                // writev syscall
+                                let mut stdout = io::stdout().lock();
+                                println!("Tried to write to fd {}", registers[10].get_u64());
+                                println!("Writing {} messages", registers[12].get_u64());
+                                let addr = registers[11].get_i64();
+                                let (mem, index) =
+                                    memory_table.map_address(addr).unwrap_or_else(|| {
+                                        panic!("Tried to read {addr}, but it was not mapped")
+                                    });
+                                for i in 0..registers[12].get_u64() as usize {
+                                    let io_vec: &iovec = from_bytes(&mem[index + i * size_of::<iovec>()..index + (i + 1) * size_of::<iovec>()]);
+                                    let mem = memory_table.map_address(io_vec.iov_base as i64).unwrap_or_else(|| panic!("Tried to output memory from non-existant address {}", registers[11].get_i64()));
+                                    let len = io_vec.iov_len as usize;
                                     match stdout.write(&mem.0[mem.1..mem.1 + len]) {
                                         Ok(written) => {
                                             registers[10].put_i64(written as i64);
@@ -583,15 +633,95 @@ fn run_elf(path: PathBuf) {
                             93 => {
                                 exit(registers[10].get_i64() as i32);
                             }
+                            96 => {
+                                registers[10].put_i64(0);
+                                // set_tid_address
+                                // no-op, new threads cannot be created
+                            }
+                            99 => {
+                                registers[10].put_i64(0);
+                                // set_robust_list
+                                // no-op, futexes will not notify other threads because new threads cannot be created
+                            }
+                            113 => {
+                                // clock_gettime
+                                if registers[10].get_u64() == 1 {
+                                    // monotonic
+                                    let addr = registers[11].get_u64();
+                                    let (mem, addr) = memory_table
+                                        .map_address_mut(addr as i64)
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "Tried to write to {addr}, but it was not mapped!"
+                                            )
+                                        });
+                                    let now = Instant::now();
+                                    let diff = now - start;
+                                    let time = timespec {
+                                        tv_sec: diff.as_secs() as i64,
+                                        tv_nsec: (diff.as_nanos() % 1_000_000_000) as i64,
+                                    };
+                                    mem[addr..addr + size_of::<timespec>()]
+                                        .copy_from_slice(bytes_of(&time));
+                                } else {
+                                    todo!();
+                                }
+                            }
+                            160 => {
+                                let addr = registers[10].get_u64();
+                                let (mem, addr) = memory_table
+                                    .map_address_mut(addr as i64)
+                                    .unwrap_or_else(|| {
+                                        panic!("Tried to write to {addr}, but it was not mapped!")
+                                    });
+                                mem[addr..addr + size_of::<new_utsname>()]
+                                    .copy_from_slice(bytes_of(&new_utsname::default()));
+                                registers[10].put_i64(0);
+                            }
                             174 | 175 | 176 | 177 => {
                                 // checking uid, euid, gid, egid
                                 registers[10].put_i64(1000);
                             }
                             214 => {
                                 // BRK
-                                let value = registers[11].get_u64();
-                                debug!("Tried expanding memory to {value:x}");
-                                todo!();
+                                let value = registers[10].get_i64();
+                                let num_segments = memory_table.len();
+                                let cur_heap = &mut memory_table[num_segments - 2];
+                                let new_len = cur_heap.0.memory.len() + value as usize;
+                                cur_heap.0.memory.resize(new_len, 0u8);
+                                registers[10].put_i64(cur_heap.1 + cur_heap.0.memory.len() as i64);
+                            }
+                            261 => 'call: {
+                                // prlimit64
+                                let pid = registers[10].get_i64();
+                                let resource = registers[11].get_u64();
+                                let new_rlim = registers[12].get_u64();
+                                let old_rlim = registers[13].get_u64();
+                                if pid != 0 {
+                                    registers[10].put_i64(-1); // EPERM
+                                    break 'call;
+                                }
+                                if new_rlim != 0 {
+                                    // no-op, this kernel does not enforce resource limits anyways
+                                }
+                                if old_rlim != 0 {
+                                    // write RLIM_INFINITY to old_rlim
+                                    let (mem, addr) = memory_table.map_address_mut(old_rlim as i64).unwrap_or_else(|| {
+                                        panic!("Tried to write to {old_rlim}, but it was not mapped!")
+                                    });
+                                    mem[addr..addr + 16].copy_from_slice(cast_slice(&[0u128]));
+                                }
+                            }
+                            278 => {
+                                let buf = registers[10].get_i64();
+                                let count = registers[11].get_u64();
+                                let (mem, addr) =
+                                    memory_table.map_address_mut(buf as i64).unwrap_or_else(|| {
+                                        panic!("Tried to write to {buf}, but it was not mapped!")
+                                    });
+                                OsRng
+                                    .try_fill_bytes(&mut mem[addr..addr + count as usize])
+                                    .expect("Couldn't use OS rng");
                             }
                             _ => todo!(),
                         }
@@ -662,29 +792,240 @@ fn run_elf(path: PathBuf) {
                     }
                 }
             }
-            raki::OpcodeKind::M(mopcode) => todo!(),
-            raki::OpcodeKind::A(aopcode) => todo!(),
+            raki::OpcodeKind::M(mopcode) => match mopcode {
+                raki::MOpcode::MUL => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(
+                            registers[insn.rd.unwrap()]
+                                .get_i64()
+                                .wrapping_mul(registers[insn.rs2.unwrap()].get_i64()),
+                        );
+                    }
+                }
+                raki::MOpcode::MULH => todo!(),
+                raki::MOpcode::MULHSU => todo!(),
+                raki::MOpcode::MULHU => todo!(),
+                raki::MOpcode::DIV => todo!(),
+                raki::MOpcode::DIVU => {
+                    if insn.rd.unwrap() != 0 {
+                        if registers[insn.rs2.unwrap()].get_u64() == 0 {
+                            registers[insn.rd.unwrap()].put_u64(u64::MAX);
+                        } else {
+                            registers[insn.rd.unwrap()].put_u64(
+                                registers[insn.rs1.unwrap()].get_u64()
+                                    / registers[insn.rs2.unwrap()].get_u64(),
+                            );
+                        }
+                    }
+                }
+                raki::MOpcode::REM => todo!(),
+                raki::MOpcode::REMU => todo!(),
+                raki::MOpcode::MULW => todo!(),
+                raki::MOpcode::DIVW => todo!(),
+                raki::MOpcode::DIVUW => todo!(),
+                raki::MOpcode::REMW => todo!(),
+                raki::MOpcode::REMUW => todo!(),
+            },
+            raki::OpcodeKind::A(aopcode) => match aopcode {
+                raki::AOpcode::LR_W => {
+                    // safe to copy LR implementation here, single threaded
+                    let virtual_address = registers[insn.rs1.unwrap()].get_i64();
+                    if insn.rd.unwrap() != 0 {
+                        let (segment, addr) = memory_table
+                            .map_address(virtual_address)
+                            .unwrap_or_else(|| {
+                                panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                            });
+                        registers[insn.rd.unwrap()]
+                            .put_i64((i32::from_slice(&segment[addr..addr + 4])).sign_ext(32));
+                    }
+                    memory_table.reserve(virtual_address, 4);
+                }
+                raki::AOpcode::SC_W => {
+                    let virtual_address = registers[insn.rs1.unwrap()].get_i64();
+                    if !memory_table.check_reservation(virtual_address, 4) {
+                        memory_table.invalidate_reservation();
+                        if insn.rd.unwrap() != 0 {
+                            registers[insn.rd.unwrap()].put_i64(1);
+                        }
+                    } else {
+                        let (segment, addr) = memory_table
+                            .map_address_mut(virtual_address)
+                            .unwrap_or_else(|| {
+                                panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                            });
+                        segment[addr..addr + 4].copy_from_slice(&registers[insn.rs2.unwrap()].value[0..4]);
+                        if insn.rd.unwrap() != 0 {
+                            registers[insn.rd.unwrap()].put_i64(0);
+                        }
+                    }
+                }
+                raki::AOpcode::AMOSWAP_W => {
+                    let virtual_address = registers[insn.rs1.unwrap()].get_i64();
+                    let (mem, addr) = memory_table
+                        .map_address_mut(virtual_address)
+                        .unwrap_or_else(|| {
+                            panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                        });
+                    let m_word = i32::from_slice(&mem[addr..addr + 4]);
+                    let r_word = registers[insn.rs2.unwrap()].get_u64() as u32;
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(m_word.sign_ext(32));
+                    }
+                    mem[addr..addr + 4].copy_from_slice(&r_word.to_le_bytes());
+                }
+                raki::AOpcode::AMOADD_W => todo!(),
+                raki::AOpcode::AMOXOR_W => todo!(),
+                raki::AOpcode::AMOAND_W => todo!(),
+                raki::AOpcode::AMOOR_W => todo!(),
+                raki::AOpcode::AMOMIN_W => todo!(),
+                raki::AOpcode::AMOMAX_W => todo!(),
+                raki::AOpcode::AMOMINU_W => todo!(),
+                raki::AOpcode::AMOMAXU_W => todo!(),
+                raki::AOpcode::LR_D => todo!(),
+                raki::AOpcode::SC_D => todo!(),
+                raki::AOpcode::AMOSWAP_D => todo!(),
+                raki::AOpcode::AMOADD_D => todo!(),
+                raki::AOpcode::AMOXOR_D => todo!(),
+                raki::AOpcode::AMOAND_D => todo!(),
+                raki::AOpcode::AMOOR_D => todo!(),
+                raki::AOpcode::AMOMIN_D => todo!(),
+                raki::AOpcode::AMOMAX_D => todo!(),
+                raki::AOpcode::AMOMINU_D => todo!(),
+                raki::AOpcode::AMOMAXU_D => todo!(),
+            },
             raki::OpcodeKind::C(copcode) => match copcode {
-                raki::COpcode::ADDI4SPN => todo!(),
-                raki::COpcode::LW => todo!(),
-                raki::COpcode::SW => todo!(),
-                raki::COpcode::NOP => todo!(),
-                raki::COpcode::ADDI => todo!(),
+                raki::COpcode::ADDI4SPN => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(
+                            registers[2]
+                                .get_i64()
+                                .wrapping_add(insn.imm.unwrap() as i64),
+                        );
+                    }
+                }
+                raki::COpcode::LW => {
+                    if insn.rd.unwrap() != 0 {
+                        let virtual_address =
+                            registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
+                        let (segment, addr) = memory_table
+                            .map_address(virtual_address)
+                            .unwrap_or_else(|| {
+                                panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                            });
+                        registers[insn.rd.unwrap()]
+                            .put_i64((i32::from_slice(&segment[addr..addr + 4])).sign_ext(32));
+                    }
+                }
+                raki::COpcode::SW => {
+                    let virtual_address =
+                        registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
+                    let (segment, addr) = memory_table
+                        .map_address_mut(virtual_address)
+                        .unwrap_or_else(|| {
+                            panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                        });
+                    segment[addr..addr + 4]
+                        .copy_from_slice(&registers[insn.rs2.unwrap()].value[0..4]);
+                }
+                raki::COpcode::NOP => {}
+                raki::COpcode::ADDI => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(
+                            registers[insn.rd.unwrap()]
+                                .get_i64()
+                                .wrapping_add(insn.imm.unwrap() as i64),
+                        );
+                    }
+                }
                 raki::COpcode::JAL => todo!(),
-                raki::COpcode::LI => todo!(),
-                raki::COpcode::ADDI16SP => todo!(),
-                raki::COpcode::LUI => todo!(),
-                raki::COpcode::SRLI => todo!(),
+                raki::COpcode::LI => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(insn.imm.unwrap() as i64);
+                    }
+                }
+                raki::COpcode::ADDI16SP => {
+                    registers[2].incr_i64(insn.imm.unwrap() as i64);
+                }
+                raki::COpcode::LUI => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(insn.imm.unwrap() as i64);
+                    }
+                }
+                raki::COpcode::SRLI => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_u64(
+                            registers[insn.rd.unwrap()].get_u64() >> insn.imm.unwrap() as u64,
+                        );
+                    }
+                }
                 raki::COpcode::SRAI => todo!(),
-                raki::COpcode::ANDI => todo!(),
-                raki::COpcode::SUB => todo!(),
-                raki::COpcode::XOR => todo!(),
-                raki::COpcode::OR => todo!(),
-                raki::COpcode::AND => todo!(),
-                raki::COpcode::J => todo!(),
-                raki::COpcode::BEQZ => todo!(),
-                raki::COpcode::BNEZ => todo!(),
-                raki::COpcode::SLLI => todo!(),
+                raki::COpcode::ANDI => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(
+                            registers[insn.rd.unwrap()].get_i64() & insn.imm.unwrap() as i64,
+                        );
+                    }
+                }
+                raki::COpcode::SUB => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(
+                            registers[insn.rd.unwrap()]
+                                .get_i64()
+                                .wrapping_sub(registers[insn.rs2.unwrap()].get_i64()),
+                        );
+                    }
+                }
+                raki::COpcode::XOR => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_u64(
+                            registers[insn.rd.unwrap()].get_u64()
+                                ^ registers[insn.rs2.unwrap()].get_u64(),
+                        );
+                    }
+                }
+                raki::COpcode::OR => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_u64(
+                            registers[insn.rd.unwrap()].get_u64()
+                                | registers[insn.rs2.unwrap()].get_u64(),
+                        );
+                    }
+                }
+                raki::COpcode::AND => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_u64(
+                            registers[insn.rd.unwrap()].get_u64()
+                                & registers[insn.rs2.unwrap()].get_u64(),
+                        );
+                    }
+                }
+                raki::COpcode::J => {
+                    instruction_pointer.incr_i64(insn.imm.unwrap() as i64);
+                    dumpregs(&registers, &instruction_pointer);
+                    continue;
+                }
+                raki::COpcode::BEQZ => {
+                    if registers[insn.rs1.unwrap()].get_i64() == 0 {
+                        instruction_pointer.incr_i64(insn.imm.unwrap() as i64);
+                        dumpregs(&registers, &instruction_pointer);
+                        continue;
+                    }
+                }
+                raki::COpcode::BNEZ => {
+                    if registers[insn.rs1.unwrap()].get_i64() != 0 {
+                        instruction_pointer.incr_i64(insn.imm.unwrap() as i64);
+                        dumpregs(&registers, &instruction_pointer);
+                        continue;
+                    }
+                }
+                raki::COpcode::SLLI => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_u64(
+                            registers[insn.rd.unwrap()].get_u64() << insn.imm.unwrap() as u64,
+                        );
+                    }
+                }
                 raki::COpcode::LWSP => todo!(),
                 raki::COpcode::JR => {
                     instruction_pointer.put_i64(registers[insn.rs1.unwrap()].get_i64());
@@ -696,23 +1037,89 @@ fn run_elf(path: PathBuf) {
                 }
                 raki::COpcode::EBREAK => todo!(),
                 raki::COpcode::JALR => todo!(),
-                raki::COpcode::ADD => todo!(),
+                raki::COpcode::ADD => {
+                    if insn.rd.unwrap() != 0 {
+                        registers[insn.rd.unwrap()].put_i64(
+                            registers[insn.rd.unwrap()]
+                                .get_i64()
+                                .wrapping_add(registers[insn.rs2.unwrap()].get_i64()),
+                        );
+                    }
+                }
                 raki::COpcode::SWSP => todo!(),
-                raki::COpcode::LD => todo!(),
-                raki::COpcode::SD => todo!(),
-                raki::COpcode::ADDIW => todo!(),
+                raki::COpcode::LD => {
+                    if insn.rd.unwrap() != 0 {
+                        let virtual_address =
+                            registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
+                        let (segment, addr) = memory_table
+                            .map_address(virtual_address)
+                            .unwrap_or_else(|| {
+                                panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                            });
+                        registers[insn.rd.unwrap()]
+                            .put_i64(i64::from_slice(&segment[addr..addr + 8]));
+                    }
+                }
+                raki::COpcode::SD => {
+                    let virtual_address =
+                        registers[insn.rs1.unwrap()].get_i64() + insn.imm.unwrap() as i64;
+                    let (segment, addr) = memory_table
+                        .map_address_mut(virtual_address)
+                        .unwrap_or_else(|| {
+                            panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                        });
+                    segment[addr..addr + 8].copy_from_slice(&registers[insn.rs2.unwrap()].value);
+                }
+                raki::COpcode::ADDIW => {
+                    if insn.rd.unwrap() != 0 {
+                        let sum = insn.imm.unwrap() as i64 + registers[insn.rd.unwrap()].get_i64();
+                        registers[insn.rd.unwrap()].put_i64(sum.sign_ext(32));
+                    }
+                }
                 raki::COpcode::SUBW => todo!(),
-                raki::COpcode::ADDW => todo!(),
-                raki::COpcode::LDSP => todo!(),
-                raki::COpcode::SDSP => todo!(),
+                raki::COpcode::ADDW => {
+                    if insn.rd.unwrap() != 0 {
+                        let sum = (registers[insn.rd.unwrap()].get_i64() as i32)
+                            .wrapping_add(registers[insn.rs2.unwrap()].get_i64() as i32);
+                        registers[insn.rd.unwrap()].put_i64(sum as i64);
+                    }
+                }
+                raki::COpcode::LDSP => {
+                    if insn.rd.unwrap() != 0 {
+                        let virtual_address = registers[2].get_i64() + insn.imm.unwrap() as i64;
+                        let (segment, addr) = memory_table
+                            .map_address(virtual_address)
+                            .unwrap_or_else(|| {
+                                panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                            });
+                        registers[insn.rd.unwrap()]
+                            .put_i64(i64::from_slice(&segment[addr..addr + 8]));
+                    }
+                }
+                raki::COpcode::SDSP => {
+                    let virtual_address = registers[2].get_i64() + insn.imm.unwrap() as i64;
+                    let (segment, addr) = memory_table
+                        .map_address_mut(virtual_address)
+                        .unwrap_or_else(|| {
+                            panic!("Tried to map {virtual_address}, but it wasn't mapped!")
+                        });
+                    segment[addr..addr + 8].copy_from_slice(&registers[insn.rs2.unwrap()].value);
+                }
             },
-            raki::OpcodeKind::Zifencei(zifencei_opcode) => todo!(),
+            raki::OpcodeKind::Zifencei(zifencei_opcode) => {
+                match zifencei_opcode {
+                    raki::ZifenceiOpcode::FENCE => {
+                        // emulation of single threaded machine, fence is noop
+                    }
+                }
+            }
             raki::OpcodeKind::Zicboz(zicboz_opcode) => todo!(),
             raki::OpcodeKind::Zicsr(zicsr_opcode) => todo!(),
             raki::OpcodeKind::Zicfiss(zicfiss_opcode) => todo!(),
             raki::OpcodeKind::Zicntr(zicntr_opcode) => todo!(),
             raki::OpcodeKind::Priv(priv_opcode) => todo!(),
         }
+        assert!(registers[0].get_i64() == 0);
         dumpregs(&registers, &instruction_pointer);
         let insn_size = if insn.is_compressed { 2 } else { 4 };
         instruction_pointer.incr_i64(insn_size);

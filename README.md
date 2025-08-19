@@ -15,6 +15,7 @@ RUST_LOG=trace risc-emulator <binary>
 
 ## Features
 - I extension implemented and tested with [riscv-tests](https://github.com/riscv-software-src/riscv-tests)
+- Writing to STDOUT
 
 ## Roadmap
 
