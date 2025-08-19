@@ -1,0 +1,91 @@
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu	
+        runner: 
+          - ubuntu-latest
+        include:
+            # apple for x64 and arm
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+
+            # windows
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc	
+            runner: windows-latest
+            
+            # linux
+          - target: aarch64-unknown-linux-gnu	
+            runner: ubuntu-latest
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+          - target: i686-unknown-linux-gnu
+            runner: ubuntu-latest
+      fail-fast: false
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup NASM
+        run: choco install nasm
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+
+      - name: Setup armv7 cross compiling
+        run: >
+          sudo apt install binutils-arm-linux-gnueabihf gcc-arm-linux-gnueabihf &&
+          cargo install --force --locked bindgen-cli &&
+          echo "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=/usr/bin/arm-linux-gnueabihf-gcc" >> $GITHUB_ENV
+        if: ${{ matrix.target == 'armv7-unknown-linux-gnueabihf' }}
+
+      - name: Setup 32-bit cross compiling
+        run: >
+          sudo apt install binutils-i686-linux-gnu gcc-i686-linux-gnu &&
+          echo "CARGO_TARGET_I686_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/i686-linux-gnu-gcc" >> $GITHUB_ENV
+        if: ${{ matrix.target == 'i686-unknown-linux-gnu' }}
+
+      - name: Setup aarch64 cross compiling
+        run: >
+          sudo apt install binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu &&
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: "error"
+          name: risc-emulator-${{ matrix.target }}
+          path: |
+            ./target/${{ matrix.target }}/release/risc-emulator
+            ./target/${{ matrix.target }}/release/risc-emulator.exe
